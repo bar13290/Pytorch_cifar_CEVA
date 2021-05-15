@@ -9,7 +9,7 @@ Reference:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch import Tensor
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -36,24 +36,19 @@ class BasicBlock(nn.Module):
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
+        out = self.dequant(out)
+        out += self.dequant(self.shortcut(x))
+        out = self.quant(out)
         out = F.relu(out)
         return out
 
-    def eval_quant(self, x):
-        out = self.quant(x)
-        out = F.relu(self.bn1(self.conv1(out)))
-        out = self.dequant(out)
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
-        return out
 
 class BasicBlock_relu6(nn.Module):
     expansion = 1
 
     def __init__(self, in_planes, planes, stride=1):
         super(BasicBlock_relu6, self).__init__()
+        self.quant = torch.quantization.QuantStub()
         self.conv1 = nn.Conv2d(
             in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
@@ -68,11 +63,14 @@ class BasicBlock_relu6(nn.Module):
                           kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(self.expansion*planes)
             )
+        self.dequant = torch.quantization.DeQuantStub()
 
     def forward(self, x):
         out = F.relu6(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
+        out = self.dequant(out)
+        out += self.dequant(self.shortcut(x))
+        out = self.quant(out)
         out = F.relu6(out)
         return out
 
@@ -144,19 +142,6 @@ class ResNet(nn.Module):
         out = self.linear(out)
         return out
 
-    def eval_quant(self, x):
-        out = self.quant(x)
-        out = F.relu(self.bn1(self.conv1(out)))
-        out = self.dequant(out)
-        out = self.layer1.eval_quant(out)
-        out = self.layer2.eval_quant(out)
-        out = self.layer3.eval_quant(out)
-        out = self.layer4.eval_quant(out)
-        out = F.avg_pool2d(out, 4)
-        out = out.view(out.size(0), -1)
-        out = self.linear(out)
-
-        return out
 
 class ResNet_relu6(nn.Module):
     def __init__(self, block, num_blocks, num_classes=10):
@@ -191,14 +176,37 @@ class ResNet_relu6(nn.Module):
         out = self.linear(out)
         return out
 
+class QuantizedResNet18(nn.Module):
+    def __init__(self, model):
+        super(QuantizedResNet18, self).__init__()
+        # QuantStub converts tensors from floating point to quantized.
+        # This will only be used for inputs.
+        self.quant = torch.quantization.QuantStub()
+        # DeQuantStub converts tensors from quantized to floating point.
+        # This will only be used for outputs.
+        self.dequant = torch.quantization.DeQuantStub()
+        # FP32 model
+        self.model = model
+
+    def forward(self, x):
+        # manually specify where tensors will be converted from floating
+        # point to quantized in the quantized model
+        x = self.quant(x)
+        x = self.model(x)
+        # manually specify where tensors will be converted from quantized
+        # to floating point in the quantized model
+        x = self.dequant(x)
+        return x
 
 def ResNet18():
     return ResNet(BasicBlock, [2, 2, 2, 2])
 
+
 def ResNet18_relu6():
     return ResNet_relu6(BasicBlock_relu6, [2, 2, 2, 2])
 
-
+def ResNet18_quantized(model):
+    return QuantizedResNet18(model)
 
 def ResNet34():
     return ResNet(BasicBlock, [3, 4, 6, 3])

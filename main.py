@@ -11,12 +11,10 @@ import matplotlib.pyplot as plt
 import os
 import argparse
 import numpy as np
-
-from pytorch_modelsize import SizeEstimator
 from models import *
-#from utils import progress_bar
+from utils import progress_bar
 
-flag_quan = 0
+
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
 parser.add_argument('--resume', '-r', action='store_true',
@@ -29,17 +27,17 @@ parser.add_argument('--onnx', '-o', action='store_true',
                     help='Save the model as onnx file')
 args = parser.parse_args()
 
-
+#Path
 path_to_model = './checkpoint/ckpt_v2.pth'
-path_to_quantize_model = './checkpoint/ckpt_v2_quantize.pth'
-path_to_onnx = './onnx/v1.onnx'
+path_to_quantize_model = './checkpoint/ckpt_v2_quantize_2.pth'
+path_to_onnx = './onnx/v2.onnx'
 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 best_acc = 0  # best test accuracy
-start_epoch = 1  # start from epoch 0 or last checkpoint epoch
+start_epoch = 1  # start from epoch 1 or last checkpoint epoch
 
-# Data
+############## Prepare the data ##############
 
 # number of subprocesses to use for data loading
 num_workers = 2
@@ -94,11 +92,12 @@ testloader = torch.utils.data.DataLoader(
 classes = ('plane', 'car', 'bird', 'cat', 'deer',
            'dog', 'frog', 'horse', 'ship', 'truck')
 
-# Model
+
+############## Building the Model ##############
 print('==> Building model..')
 # net = VGG('VGG19')
-net = ResNet18()
-#net = ResNet18_relu6()
+#net = ResNet18()
+net = ResNet18_relu6()
 # net = PreActResNet18()
 # net = GoogLeNet()
 # net = DenseNet121()
@@ -134,6 +133,9 @@ optimizer = optim.SGD(net.parameters(), lr=args.lr,
                       momentum=0.9, weight_decay=5e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
+############## Functions ##############
+
+
 def cal(net_prepared):
     net_prepared.eval()
     test_loss = 0
@@ -151,10 +153,7 @@ def cal(net_prepared):
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
-
-            # progress_bar(batch_idx, len(validloader), 'Epoch: %d | Loss: %.3f | Acc: %.3f%% (%d/%d)'
-            #              % (epoch, test_loss/(batch_idx+1), 100.*correct/total, correct, total))
-
+        print("Finshed Calibration process")
 
 
 def quantize(path_to_wanted_model):
@@ -164,36 +163,39 @@ def quantize(path_to_wanted_model):
     load_model = torch.load(path_to_wanted_model)
     net.load_state_dict(load_model['net'])
     net.eval()
-    # attach a global qconfig, which contains information about what kind of observers to attach
-    net.qconfig = torch.quantization.get_default_qconfig('fbgemm')
-    torch.backends.quantized.engine = 'fbgemm'
     # Fuse the activations to preceding layers
     net_fused = torch.quantization.fuse_modules(net, ['conv1', 'bn1'], ['conv2', 'bn2'])
-    # Prepare the model for static quantization
-    net_prepared = torch.quantization.prepare(net_fused, inplace=False)
+    # Define the fused model with the quantized class
+    # (for quantize and de-quantize the data before feed forwarding it)
+    quantized_net = ResNet18_quantized(model=net_fused)
+    # attach a global qconfig, which contains information about what kind of observers to attach
+    quantized_net.qconfig = torch.quantization.get_default_qconfig("fbgemm")
+    torch.backends.quantized.engine = 'fbgemm'
+    # Prepare the model for static quantization. This inserts observers in
+    # the model that will observe activation tensors during calibration.
+    quantized_net = torch.quantization.prepare(quantized_net, inplace=True)
     #calibrate the prepared model to determine quantization parameters for activations
-    cal(net_prepared)
-    net_int8 = torch.quantization.convert(net_prepared, inplace=False)
+    cal(quantized_net)
+    quantized_net = torch.quantization.convert(quantized_net, inplace=True)
     #Saving the model
     print("saving the quantized model")
     state = {
-        'net': net_int8.state_dict(),
+        'net': quantized_net.state_dict(),
     }
     if not os.path.isdir('checkpoint'):
         os.mkdir('checkpoint')
     torch.save(state, path_to_quantize_model)
     print("Fisinshed quantizing he model")
-    #Check performances
+    #Check performances - evaluate the quantized model
     test_loss = 0.0
     class_correct = list(0. for i in range(10))
     class_total = list(0. for i in range(10))
-
-    net_int8.eval()
+    quantized_net.eval()
     # iterate over test data
+    print("Start evaluate the quantized model")
     for data, target in testloader:
-        print(target)
         # forward pass: compute predicted outputs by passing inputs to the model
-        output = net_int8.eval_quant(data)
+        output = quantized_net(data)
         # calculate the batch loss
         loss = criterion(output, target)
         # update test loss
@@ -208,6 +210,7 @@ def quantize(path_to_wanted_model):
             label = target.data[i]
             class_correct[label] += correct[i].item()
             class_total[label] += 1
+        print("finished evaluate single test batch")
 
     # average test loss
     test_loss = test_loss / len(testloader.dataset)
@@ -224,10 +227,9 @@ def quantize(path_to_wanted_model):
     print('\nTest Accuracy (Overall): %2d%% (%2d/%2d)' % (
         100. * np.sum(class_correct) / np.sum(class_total),
         np.sum(class_correct), np.sum(class_total)))
-
     return
 
-# Training
+
 def train(epoch):
     print('\nEpoch: %d' % epoch)
     net.train()
@@ -253,6 +255,7 @@ def train(epoch):
         progress_bar(batch_idx, len(trainloader), 'Epoch: %d | Loss: %.3f | Acc: %.3f%% (%d/%d)'
                      % (epoch, train_loss/(batch_idx+1), 100.*correct/total, correct, total))
     return (train_loss/(batch_idx+1) ,(100.*correct/total))
+
 
 def val(epoch):
     global best_acc
@@ -289,6 +292,7 @@ def val(epoch):
         torch.save(state, path_to_model)
         best_acc = acc
     return test_loss / (batch_idx + 1), (100. * correct / total)
+
 
 def test(path_to_model):
     # Load checkpoint.
@@ -338,6 +342,7 @@ def test(path_to_model):
         100. * np.sum(class_correct) / np.sum(class_total),
         np.sum(class_correct), np.sum(class_total)))
 
+
 def onnx(onnx_name):
     print('==> Loading the model parameters..')
     assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
@@ -349,25 +354,24 @@ def onnx(onnx_name):
     print("Starting export onnx file!")
     torch.onnx.export(net, dummy_input, onnx_name, verbose=False)
     print("Saved onnx file at : {}".format(onnx_name))
-    return
 
 
-if (args.onnx):
+
+# choose the case due to the args
+
+if (args.onnx):    #Create onnx
     onnx(path_to_onnx)
 
-if (args.test):
+elif (args.test):  #Evaluate the model
     print("Start Testing")
-    if args.quan:
-        test(path_to_quantize_model)
-    else:
-        test(path_to_model)
+    test(path_to_model)
     print("Finish Testing")
 
-elif (args.quan or flag_quan==1):
+elif (args.quan):  #Quantize the already trained model
     print("Quantizing model: {}".format(path_to_model))
     quantize(path_to_model)
 
-else:
+else:             #Train the model
     print("#####  Starting The Training Session!!!  #####")
     arr_loss_train = []
     arr_loss_val = []
